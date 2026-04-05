@@ -1,0 +1,15 @@
+# Scholia-AI
+
+A streamlit-based PDF QnA chatbot using langchain, FAISS, HuggingFace embeddings and OLLAMA LLM
+It allows users to upload PDF and ask questions with GPU CUDA acceleration support.
+
+## Features
+- PDF upload and indexing
+- GPU enabled embeddings and reranked
+- LLM driven QnA with context extraction
+- Chat history support
+
+## Installation
+```bash
+pip install -r requirements.txt
+streamlit run app.py

@@ -1,0 +1,13 @@
+streamlit
+tempfile
+hashlib
+torch
+faiss-cpu
+faiss-gpu
+langchain
+langchain-ollama
+langchain-huggingface
+langchain-community
+sentence-transformers
+pypdf
+langchain-text-splitters

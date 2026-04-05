@@ -1,9 +1,6 @@
-streamlit
-tempfile
-hashlib
+streamlit>=1.26
 torch
 faiss-cpu
-faiss-gpu
 langchain
 langchain-ollama
 langchain-huggingface

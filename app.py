@@ -365,9 +365,9 @@ if uploaded_files:
             st.markdown(f"**Page {page} Preview:**")
             st.write(preview + "...")
 
-        for doc, score in docs:
+        for doc in docs:
             page = doc.metadata.get("page", 0) + 1
-            st.markdown(f"**Page {page} (Score: {score:.2f}))**")
+            st.markdown(f"**Page {page}**")
             st.write(doc.page_content)
 
 else:

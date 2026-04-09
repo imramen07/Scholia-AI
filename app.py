@@ -27,8 +27,9 @@ uploaded_files = st.sidebar.file_uploader(
 )
 
 #torch
+torch.set_num_threads(4)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Device: {DEVICE}")
+st.sidebar.write(f"Device: {DEVICE}")
 
 #loaders(cache)
 @st.cache_resource
@@ -43,7 +44,7 @@ def load_llm():
     return OllamaLLM(
         model = "llama3",
         num_ctx = 4096,
-        temperature = 0.2
+        temperature = 0.0
     )
 
 @st.cache_resource
@@ -53,54 +54,16 @@ def load_reranker():
         device = DEVICE)
 
 #helpers
-def format_context(docs):
-    """Structured context for LLM"""
-    context = ""
-    sources = []
-    
-    for doc, score in docs:
-        page = doc.metadata.get("page", 0) + 1
-        context += f"[Page {page}]\n{doc.page_content}\n\n"
-        sources.append(page)
-    
-    return context, sorted(set(sources))
-
-def build_prompt(context, query):
-    return f"""
-
-You are strict document Q/A assistant.
-
-RULES:
-- Answer ONLY from context
-- Maximum 4 lines
-- Include exact quote from context with page number
-- Do not explain beyond context
-- If missing, then say "Not found in document"
-
-Context:
-{context}
-
-Question:
-{query}
-
-Answer:
-"""
-
-def limit_context(docs, max_chars = 1500):
-    context = ""
-    sources = []
+def deduplicate_docs(docs):
+    seen = set()
+    unique_docs = []
 
     for doc in docs:
         text = doc.page_content.strip()
-        page = doc.metadata.get("page", 0) + 1
-
-        if len(context) + len(text) > max_chars:
-            break
-
-        context += f"[Page {page}]\n{text}\n\n"
-        sources.append(page)
-
-    return context, sorted(set(sources))
+        if text not in seen:
+            seen.add(text)
+            unique_docs.append(doc)
+    return unique_docs
 
 #extract relevance
 def extract_relevant_sentences(docs, query, max_sentences = 5):
@@ -165,6 +128,33 @@ def build_chat_context(messages, limit = 3):
         history += f"{role.upper()}: {content}\n"
     return history
 
+#build prompt
+def build_prompt(context, query, extra = "", history = ""):
+    return f"""
+You are strict document QNA assistant.
+
+STRICT RULES:
+- Answer ONLY from the provided context.
+- DO NOT use outside knowledge.
+- If not found, then say "Not found in document".
+- Answer must be concise (Max 3 lines).
+- Do NOT assume anything.
+- Include page numbers like [Page X]
+
+{extra}
+
+Conversation History:
+{history}
+
+Context:
+{context}
+
+Question:
+{query}
+
+Answer:
+"""
+
 #main
 if uploaded_files:
     file_bytes = uploaded_files.read()
@@ -195,8 +185,8 @@ if uploaded_files:
                 st.stop()
 
             splitter = RecursiveCharacterTextSplitter(
-                chunk_size = 250,
-                chunk_overlap = 50
+                chunk_size = 300,
+                chunk_overlap = 80
             )
 
             chunks = splitter.split_documents(pages)
@@ -221,15 +211,25 @@ if uploaded_files:
                 allow_dangerous_deserialization=True
             )
 
-    if DEVICE == "cuda":
-        res = faiss.StandardGpuResources()
-        db_index = db.index
-        db.index = faiss.index_cpu_to_gpu(res, 0, db_index)
+    if DEVICE == "cuda" and "db" in st.session_state:
+        try:
+            res = faiss.StandardGpuResources()
+            db = st.session_state.db
+            db.index = faiss.index_cpu_to_gpu(res, 0, db.index)
+            st.session_state.db = db
+        except:
+            pass
 
     st.sidebar.success("Document Ready")
 
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("Built with 💗 by Ramen")
+
     #load model
     llm = load_llm()
+
+    #reranker
+    reranker = load_reranker()
 
     #chat history
     if "messages" not in st.session_state:
@@ -241,59 +241,66 @@ if uploaded_files:
     #input
     query = st.chat_input("Ask Scholia")
 
+    if query and not query.strip():
+        st.stop()
+
     if query:
         st.session_state.messages.append({"role": "user", "content": query})
         st.chat_message("user").write(query)
 
         #refining query
-        refined_query = llm.invoke(f"Rewrite this for document search:\n{query}")
+        refined_query = query.lower().strip()
 
         db = st.session_state.db
 
         #retrieval
         docs = db.max_marginal_relevance_search(
             refined_query,
-            k = 4,
-            fetch_k = 8
+            k = 5,
+            fetch_k = 10
         )
 
-        #reranking
-        reranker = load_reranker()
-
-        pairs = [(query, doc.page_content) for doc in docs]
-
-        if all(len(doc.page_content) < 200 for doc in docs):
-            scores = [1.0]*len(docs)
-        else:
-            scores = reranker.predict(pairs)
-
-        reranked = sorted(
-            zip(docs, scores),
-            key = lambda x: x[1],
-            reverse = True
-        )
-
-        #reranker optional if score low
-        if max(scores) < 0.1:
-            top_docs = docs[:3]
-        
-        else:
-            THRESHOLD = max(scores) * 0.6
-            filtered = [
-                (doc, score) for (doc, score) in reranked
-                if score > THRESHOLD
-            ]
-            top_docs = [doc for doc, score in filtered][:3]
-
-        if not top_docs:
+        #if no docs retrieved
+        if not docs:
             response = "Not found in document"
             st.session_state.messages.append(
                 {"role": "assistant", "content": response}
             )
             st.stop()
 
+        pairs = [(query, doc.page_content) for doc in docs]
+
+        #scoring
+        if all(len(doc.page_content) < 200 for doc in docs):
+            scores = [1.0] * len(docs)
+        else:
+            scores = reranker.predict(pairs)
+
+        #sort by score
+        reranked = sorted(
+            zip(docs, scores),
+            key = lambda x: x[1],
+            reverse = True
+        )
+
+        #select
+        if not scores:
+            top_docs = docs[:3]
+
+        elif max(scores) < 0.2:
+            top_docs = docs[:3]
+
+        else:
+            THRESHOLD = max(0.2, max(scores) * 0.5)
+            top_docs = [
+                doc for doc, score in reranked if score >= THRESHOLD
+            ][:3]
+
+        if not top_docs:
+            top_docs = [doc for doc, _ in reranked[:2]]
+
         #filtered
-        top_docs = [doc for doc, score in filtered][:3]
+        top_docs = deduplicate_docs(top_docs)
 
         if not top_docs:
             response = "No relevant context found in the document."
@@ -301,10 +308,10 @@ if uploaded_files:
             st.stop()
 
         #extract
-        context, sources = limit_context(top_docs, max_chars = 3000)
+        context, sources = extract_relevant_sentences(top_docs, query)
 
         #fallback to raw top_doc
-        if not context.strip():
+        if len(context.strip()) < 50:
             top_doc = top_docs[0]
             page = top_doc.metadata.get("page", 0) + 1
             context = f"[Page {page}]\n{top_doc.page_content}"
@@ -320,20 +327,8 @@ if uploaded_files:
             "definition": "Give a clear definition."
         }.get(intent, "")
 
-        prompt = f"""
-        Conversation History:
-        You are a strict document QNA assistant.
-        Answer ONLY from the context below.
-        If the answer is not in the context, say "Not found in document"
-        
-        Context:
-        {context}
-
-        Question:
-        {query}
-
-        Answer:
-        """
+        #call prompt
+        prompt = build_prompt(context, query, extra, chat_history)
 
         #response
         with st.spinner("Thinking..."):
@@ -356,19 +351,21 @@ if uploaded_files:
         with st.expander("Copy Latest Answer"):
             st.text_area("Answer", full_response, height = 150)
 
+        best_doc = top_docs[0]
+        best_page = best_doc.metadata.get("page", 0) + 1
+
+        st.markdown("Most Relevant")
+        st.write(f"Page {best_page}:")
+        st.write(best_doc.page_content[:300] + "...")
+
         #sources
         st.markdown("Sources")
         for doc in top_docs:
             page = doc.metadata.get("page", 0) + 1
-            preview = doc.page_content[:200]
+            preview = doc.page_content[:150].strip().replace("\n", " ")
 
             st.markdown(f"**Page {page} Preview:**")
             st.write(preview + "...")
-
-        for doc in docs:
-            page = doc.metadata.get("page", 0) + 1
-            st.markdown(f"**Page {page}**")
-            st.write(doc.page_content)
 
 else:
     st.info("Upload a PDF to start chat")

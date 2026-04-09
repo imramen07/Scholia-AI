@@ -14,5 +14,4 @@ It allows users to upload PDF and ask questions with GPU CUDA acceleration suppo
 pip install -r requirements.txt
 streamlit run app.py
 
-## Note
-requires OLLAMA installed and running
+requires ollama\llama3 installed and running

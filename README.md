@@ -5,7 +5,7 @@ It allows users to upload PDF and ask questions with GPU CUDA acceleration suppo
 
 ## Features
 - PDF upload and indexing
-- GPU enabled embeddings and reranked
+- GPU enabled embeddings and reranking
 - LLM driven QnA with context extraction
 - Chat history support
 
@@ -13,3 +13,6 @@ It allows users to upload PDF and ask questions with GPU CUDA acceleration suppo
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
+
+## Note
+requires OLLAMA installed and running

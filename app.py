@@ -11,6 +11,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaLLM
 from sentence_transformers import CrossEncoder
+from collections import defaultdict
 
 #config
 st.set_page_config(
@@ -23,7 +24,7 @@ st.sidebar.title("Upload Document")
 uploaded_files = st.sidebar.file_uploader(
     "Choose a PDF",
     type = "pdf",
-    accept_multiple_files = False
+    accept_multiple_files = True
 )
 
 #torch
@@ -91,7 +92,11 @@ def extract_relevant_sentences(docs, query, max_sentences = 5):
             common_words = query_words.intersection(sentence_words)
 
             if len(common_words) >= 2:
-                selected.append((s, doc.metadata.get("page", 0) + 1))
+                selected.append((
+                    s,
+                    doc.metadata.get("page", 0) + 1,
+                    doc.metadata.get("source", "Unknown")
+                ))
 
             if len(selected) >= max_sentences:
                 break
@@ -100,13 +105,13 @@ def extract_relevant_sentences(docs, query, max_sentences = 5):
             break
     
     context = ""
-    sources = set()
+    pages_used = set()
 
-    for sent, page in selected:
-        context += f"[Page {page}] {sent}.\n"
-        sources.add(page)
+    for sent, page, source in selected:
+        context += f"[{source} - Page {page}] {sent}.\n"
+        pages_used.add((source, page))
     
-    return context, sorted(sources)
+    return context, sorted(pages_used, key = lambda x: (x[0], x[1]))
 
 #query intent
 def detect_intent(query):
@@ -139,7 +144,7 @@ STRICT RULES:
 - If not found, then say "Not found in document".
 - Answer must be concise (Max 3 lines).
 - Do NOT assume anything.
-- Include page numbers like [Page X]
+- Include source and page numbers like [file.pdf - Page X]
 
 {extra}
 
@@ -157,8 +162,18 @@ Answer:
 
 #main
 if uploaded_files:
-    file_bytes = uploaded_files.read()
-    file_hash = hashlib.md5(file_bytes).hexdigest()
+    file_data = []
+
+    for f in uploaded_files:
+        data = f.read()
+        file_data.append((f.name, data))
+
+    all_bytes = b"".join([data for _, data in file_data])
+    file_hash = hashlib.md5(all_bytes).hexdigest()
+    
+    for f in uploaded_files:
+        f.seek(0)
+
     index_dir = f"faiss_index_{file_hash}"
 
     file_changed = (
@@ -166,33 +181,46 @@ if uploaded_files:
         st.session_state.processed_file != file_hash
     )
 
-    #save temp file
-    if file_changed:
-        with tempfile.NamedTemporaryFile(delete = False, suffix = "pdf") as tmp:
-            tmp.write(file_bytes)
-            st.session_state.pdf_path = tmp.name
-
     embeddings = load_embeddings()
 
     #process pdf, build db
     if file_changed:
         with st.spinner("Indexing Document..."):
             try:
-                loader = PyPDFLoader(st.session_state.pdf_path)
-                pages = loader.load()
+                all_pages = []
+                
+                for name, data in file_data:
+                    with tempfile.NamedTemporaryFile(delete = False, suffix = ".pdf") as tmp:
+                        tmp.write(data)
+                        tmp_path = tmp.name
+                
+                    try:
+                        loader = PyPDFLoader(tmp_path)
+                        pages = loader.load()
+
+                    finally:
+                        #delete tempfile
+                        os.remove(tmp_path)
+
+                    #attaching sources
+                    for p in pages:
+                        p.metadata["source"] = name
+
+                    all_pages.extend(pages)
+
             except Exception as e:
                 st.error(f"Error loading pdf: {e}")
                 st.stop()
-
+            
             splitter = RecursiveCharacterTextSplitter(
                 chunk_size = 300,
                 chunk_overlap = 80
             )
 
-            chunks = splitter.split_documents(pages)
+            chunks = splitter.split_documents(all_pages)
 
-            st.sidebar.write(f"Pages : {len(pages)}")
-            st.sidebar.write(f"Chunks : {len(chunks)}")
+            st.sidebar.write(f"Total pages: {len(all_pages)}")
+            st.sidebar.write(f"Chunks: {len(chunks)}")
 
             db = FAISS.from_documents(chunks, embeddings)
 
@@ -202,13 +230,14 @@ if uploaded_files:
             st.session_state.db = db
             st.session_state.processed_file = file_hash
             st.session_state.messages = []
+
     else:
         #load existing index
         if "db" not in st.session_state and os.path.exists(index_dir):
             st.session_state.db = FAISS.load_local(
                 index_dir,
                 embeddings,
-                allow_dangerous_deserialization=True
+                allow_dangerous_deserialization = True
             )
 
     if DEVICE == "cuda" and "db" in st.session_state:
@@ -308,14 +337,15 @@ if uploaded_files:
             st.stop()
 
         #extract
-        context, sources = extract_relevant_sentences(top_docs, query)
+        context, pages_used = extract_relevant_sentences(top_docs, query)
 
         #fallback to raw top_doc
         if len(context.strip()) < 50:
             top_doc = top_docs[0]
             page = top_doc.metadata.get("page", 0) + 1
-            context = f"[Page {page}]\n{top_doc.page_content}"
-            sources = [page]
+            source = top_doc.metadata.get("source", "Unknown")
+            context = f"[{source} - Page {page}]\n{top_doc.page_content}"
+            pages_used = [(source, page)]
 
         #chat history + intent + prompt
         chat_history = build_chat_context(st.session_state.messages)
@@ -352,20 +382,22 @@ if uploaded_files:
             st.text_area("Answer", full_response, height = 150)
 
         best_doc = top_docs[0]
+        source = best_doc.metadata.get("source", "Unknown")
         best_page = best_doc.metadata.get("page", 0) + 1
 
         st.markdown("Most Relevant")
-        st.write(f"Page {best_page}:")
+        st.write(f"{source} - Page {best_page}")
         st.write(best_doc.page_content[:300] + "...")
 
         #sources
-        st.markdown("Sources")
-        for doc in top_docs:
-            page = doc.metadata.get("page", 0) + 1
-            preview = doc.page_content[:150].strip().replace("\n", " ")
+        st.markdown("Sources Used")
+        grouped = defaultdict(list)
+        for src, pg in pages_used:
+            grouped[src].append(pg)
 
-            st.markdown(f"**Page {page} Preview:**")
-            st.write(preview + "...")
+        for src in grouped:
+            pages = sorted(grouped[src])
+            st.write(f"{src}: Pages {', '.join(map(str, pages))}")
 
 else:
     st.info("Upload a PDF to start chat")
